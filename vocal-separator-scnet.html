@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ボーカル抽出 高精度版（ブラウザ内で完結）</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.webgpu.min.js"></script>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1d1f24; --muted:#666b74; --card:#ffffff; --line:#d9dbe0; --accent:#2f5d8a; --ok:#2a7d4f; --err:#b3372f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e8eb; --muted:#9aa0aa; --card:#1f2228; --line:#363a42; --accent:#6aa3d8; --ok:#5cbf8a; --err:#e5706a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, "Hiragino Sans", "Yu Gothic", sans-serif; line-height:1.7; }
+  main { max-width: 680px; margin: 0 auto; padding: 2rem 1rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .3rem; }
+  h2 { font-size: 1.05rem; margin: 0 0 .6rem; }
+  .lead { color: var(--muted); margin: 0 0 1.5rem; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 1.1rem 1.2rem; margin-bottom: 1rem; }
+  .row { margin: .6rem 0; }
+  .status { font-size:.88rem; color: var(--muted); }
+  .status.ok { color: var(--ok); }
+  input[type=file] { margin-top:.25rem; max-width:100%; }
+  button { font: inherit; padding:.65rem 1.5rem; border-radius:6px; border:1px solid var(--accent); background: var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  progress { width:100%; height:10px; margin-top:.8rem; }
+  #log { font-size:.88rem; color:var(--muted); white-space:pre-wrap; margin-top:.5rem; }
+  #log.err { color: var(--err); }
+  .result { margin-top:1rem; }
+  .result audio { width:100%; margin:.3rem 0; display:block; }
+  .result a { font-size:.92rem; color: var(--accent); }
+  small { color: var(--muted); }
+  label.opt { font-size:.92rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ボーカル抽出（高精度版）</h1>
+  <p class="lead">曲をボーカルと伴奏に分けます。処理はすべてこのブラウザの中で行われ、音声は外部に送信されません。</p>
+
+  <section>
+    <h2>1. モデルファイル</h2>
+    <small>SCNet small のONNXファイル（scnet_small_fp16.onnx など）を選びます。一度選べばこのブラウザに保存され、次回からは不要です。</small>
+    <div class="row">
+      <input type="file" id="model" accept=".onnx">
+      <div class="status" id="sm">未選択</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 曲ファイル</h2>
+    <input type="file" id="audio" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg">
+    <div class="status" id="sf">未選択</div>
+  </section>
+
+  <section>
+    <h2>3. 分離する</h2>
+    <div class="row"><label class="opt"><input type="checkbox" id="gpu" checked> GPU（WebGPU）を試す（使えない場合は自動でCPUに切り替えます）</label></div>
+    <button id="run" disabled>分離を開始</button>
+    <progress id="bar" value="0" max="1" hidden></progress>
+    <div id="log"></div>
+    <div class="result" id="result"></div>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+
+// ---------- 定数（scnet_small の埋め込み設定に合わせる） ----------
+const SR = 44100, N = 4096, H = 1024, BINS = 2049, T = 476;
+const L = 485100;                 // 1チャンクの音声長（logical_segment_samples）
+const PADTAIL = 1300;             // 末尾に足す無音（stft_pad_samples）
+const M = L + PADTAIL;            // 486400（モデルが想定する長さ）
+const STEP = Math.floor(L * 0.75);// チャンクの間隔（重なり25%）
+const SCALE = Math.sqrt(N);       // normalized STFT の係数
+
+// ---------- モデルの保存（IndexedDB） ----------
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('spleeter-models', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('m');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function cacheGet(key) {
+  try {
+    const db = await idb();
+    return await new Promise((res, rej) => {
+      const q = db.transaction('m').objectStore('m').get(key);
+      q.onsuccess = () => res(q.result || null); q.onerror = () => rej(q.error);
+    });
+  } catch (e) { return null; }
+}
+async function cachePut(key, buf) {
+  try {
+    const db = await idb();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('m', 'readwrite');
+      tx.objectStore('m').put(buf, key); tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+    return true;
+  } catch (e) { return false; }
+}
+
+// ---------- ONNX埋め込みメタデータの読み取り ----------
+function readMeta(buf) {
+  const u = new Uint8Array(buf), dec = new TextDecoder();
+  let p = 0;
+  const varint = () => { let r = 0, m = 1, b; do { b = u[p++]; r += (b & 0x7f) * m; m *= 128; } while (b & 0x80); return r; };
+  const skip = (w) => { if (w === 0) varint(); else if (w === 1) p += 8; else if (w === 5) p += 4; else if (w === 2) { const l = varint(); p += l; } else throw new Error('wire'); };
+  const meta = {};
+  try {
+    while (p < u.length) {
+      const tag = varint(), f = Math.floor(tag / 8), w = tag & 7;
+      if (f === 14 && w === 2) {
+        const len = varint(), end = p + len;
+        let k = '', v = '';
+        while (p < end) {
+          const t = varint(), ff = Math.floor(t / 8), ww = t & 7;
+          if (ww === 2) { const l = varint(); const s = dec.decode(u.subarray(p, p + l)); p += l; if (ff === 1) k = s; else if (ff === 2) v = s; }
+          else skip(ww);
+        }
+        p = end; meta[k] = v;
+      } else skip(w);
+    }
+  } catch (e) { /* 読めなくても続行 */ }
+  return meta;
+}
+function checkModel(buf) {
+  const m = readMeta(buf);
+  if (!m.model_family) return null;     // 設定が無いファイルは確認しない
+  const ok = m.model_family === 'scnet' && m.stft_n_fft === '4096' && m.stft_hop_length === '1024' &&
+             m.stft_normalized === 'true' && m.stft_window === 'hann' && m.segment_samples === String(M) &&
+             m.logical_segment_samples === String(L) && m.sources === '["drums", "bass", "other", "vocals"]';
+  return ok ? null : 'このモデルは、このページが想定する設定（scnet_small 系）と違います。';
+}
+
+const state = { model: null, audio: null };
+const refresh = () => { $('run').disabled = !(state.model && state.audio); };
+const setStatus = (id, t, ok) => { const e = $(id); e.textContent = t; e.className = 'status' + (ok ? ' ok' : ''); };
+
+$('model').addEventListener('change', async () => {
+  const f = $('model').files[0]; if (!f) return;
+  const buf = await f.arrayBuffer();
+  const problem = checkModel(buf);
+  if (problem) { state.model = null; setStatus('sm', f.name + '：' + problem, false); $('sm').style.color = 'var(--err)'; refresh(); return; }
+  state.model = buf;
+  const saved = await cachePut('scnet', buf);
+  setStatus('sm', f.name + '（' + (buf.byteLength / 1048576).toFixed(1) + ' MB）' + (saved ? ' 保存しました' : ' ※保存できませんでした。次回も選択が必要です'), true);
+  refresh();
+});
+$('audio').addEventListener('change', () => {
+  state.audio = $('audio').files[0] || null;
+  setStatus('sf', state.audio ? state.audio.name : '未選択', !!state.audio);
+  refresh();
+});
+(async () => {
+  const b = await cacheGet('scnet');
+  if (b && !checkModel(b)) { state.model = b; setStatus('sm', '保存済みのモデルを使います（変更する場合は選び直してください）', true); }
+  refresh();
+})();
+
+// ---------- FFT ----------
+const win = new Float32Array(N);
+for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);   // 周期ハン窓
+const cosT = new Float64Array(N / 2), sinT = new Float64Array(N / 2);
+for (let i = 0; i < N / 2; i++) { cosT[i] = Math.cos(2 * Math.PI * i / N); sinT[i] = Math.sin(2 * Math.PI * i / N); }
+const rev = new Uint16Array(N);
+for (let i = 0, bits = Math.log2(N); i < N; i++) {
+  let r = 0; for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
+  rev[i] = r;
+}
+function fft(re, im) {
+  for (let i = 0; i < N; i++) {
+    const j = rev[i];
+    if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let size = 2; size <= N; size <<= 1) {
+    const half = size >> 1, step = N / size;
+    for (let i = 0; i < N; i += size) {
+      for (let j = 0, k = 0; j < half; j++, k += step) {
+        const wr = cosT[k], wi = -sinT[k];
+        const a = i + j, b = a + half;
+        const xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+      }
+    }
+  }
+}
+
+// ---------- STFT / iSTFT（torch.stft の center=True, reflect, normalized=True 相当） ----------
+// 入力: 長さ L の音声1ch。出力: [周波数ビン][フレーム] の並びの実部・虚部（各 BINS*T）
+const fr = new Float64Array(N), fi = new Float64Array(N);
+function analyze(seg) {
+  const refl = new Float32Array(M + N);               // 末尾に無音を足した後、両端を反射で拡張
+  const pad = new Float32Array(M); pad.set(seg);      // 末尾 PADTAIL は 0
+  for (let j = 0; j < M + N; j++) {
+    let idx = j - N / 2;
+    if (idx < 0) idx = -idx;
+    else if (idx >= M) idx = 2 * (M - 1) - idx;
+    refl[j] = pad[idx];
+  }
+  const re = new Float32Array(BINS * T), im = new Float32Array(BINS * T);
+  for (let t = 0; t < T; t++) {
+    const st = t * H;
+    for (let i = 0; i < N; i++) { fr[i] = refl[st + i] * win[i]; fi[i] = 0; }
+    fft(fr, fi);
+    for (let b = 0; b < BINS; b++) { re[b * T + t] = fr[b] / SCALE; im[b * T + t] = fi[b] / SCALE; }
+  }
+  return { re, im };
+}
+const OUTLEN = (T - 1) * H + N;                       // 490496
+const env = new Float32Array(OUTLEN);
+for (let t = 0; t < T; t++) for (let i = 0; i < N; i++) env[t * H + i] += win[i] * win[i];
+const gr = new Float64Array(N), gi = new Float64Array(N);
+function synth(re, im) {                               // [ビン][フレーム] → 長さ L の音声
+  const acc = new Float32Array(OUTLEN);
+  for (let t = 0; t < T; t++) {
+    for (let b = 0; b < BINS; b++) { gr[b] = re[b * T + t] * SCALE; gi[b] = -im[b * T + t] * SCALE; }
+    gi[0] = 0; gi[BINS - 1] = 0;
+    for (let k = 1; k < BINS - 1; k++) { gr[N - k] = gr[k]; gi[N - k] = -gi[k]; }
+    fft(gr, gi);
+    const st = t * H;
+    for (let i = 0; i < N; i++) acc[st + i] += (gr[i] / N) * win[i];
+  }
+  const out = new Float32Array(L);
+  for (let i = 0; i < L; i++) { const e = env[N / 2 + i]; out[i] = e > 1e-8 ? acc[N / 2 + i] / e : 0; }
+  return out;
+}
+
+// ---------- WAV ----------
+function toWav(l, r) {
+  const n = l.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const s = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  s(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); s(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true);
+  v.setUint32(24, SR, true); v.setUint32(28, SR * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  s(36, 'data'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) for (const ch of [l, r]) {
+    const x = Math.max(-1, Math.min(1, ch[i]));
+    v.setInt16(o, x < 0 ? x * 32768 : x * 32767, true); o += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// ---------- 分離本体 ----------
+const log = (t, err) => { $('log').textContent = t; $('log').className = err ? 'err' : ''; };
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+// 三角形の重み（チャンクのつなぎ目をなめらかにする）
+const tri = new Float32Array(L);
+for (let i = 0; i < L; i++) tri[i] = Math.min(i + 1, L - i) / (L / 2);
+
+async function separate(ch, runner, onProgress) {
+  const n = ch[0].length;
+  const outV = [new Float32Array(n), new Float32Array(n)];
+  const outI = [new Float32Array(n), new Float32Array(n)];
+  const wsum = new Float32Array(n);
+  const starts = []; for (let s = 0; s < n; s += STEP) starts.push(s);
+
+  for (let ci = 0; ci < starts.length; ci++) {
+    const s = starts[ci];
+    const m = Math.min(L, n - s);
+    // 最後の短いチャンクは、前の音声を含めて L の長さに広げる
+    const base = m < L ? Math.round(s + m / 2 - L / 2) : s;
+    const segs = ch.map((c) => {
+      const a = new Float32Array(L);
+      for (let i = 0; i < L; i++) { const k = base + i; a[i] = (k >= 0 && k < n) ? c[k] : 0; }
+      return a;
+    });
+    const specs = segs.map(analyze);
+    const sr = new Float32Array(2 * BINS * T), si = new Float32Array(2 * BINS * T);
+    for (let c = 0; c < 2; c++) { sr.set(specs[c].re, c * BINS * T); si.set(specs[c].im, c * BINS * T); }
+
+    const out = await runner(sr, si);                  // { re, im } 形は [4,2,BINS,T]
+    const plane = BINS * T;
+    for (let c = 0; c < 2; c++) {
+      const vRe = out.re.subarray((3 * 2 + c) * plane, (3 * 2 + c + 1) * plane);
+      const vIm = out.im.subarray((3 * 2 + c) * plane, (3 * 2 + c + 1) * plane);
+      const iRe = new Float32Array(plane), iIm = new Float32Array(plane);
+      for (let st = 0; st < 3; st++) {
+        const o = (st * 2 + c) * plane;
+        for (let k = 0; k < plane; k++) { iRe[k] += out.re[o + k]; iIm[k] += out.im[o + k]; }
+      }
+      const v = synth(vRe, vIm), ins = synth(iRe, iIm);
+      const off = s - base;                            // 広げた分のずれ
+      for (let i = 0; i < m; i++) {
+        const w = tri[i];
+        outV[c][s + i] += v[off + i] * w;
+        outI[c][s + i] += ins[off + i] * w;
+        if (c === 0) wsum[s + i] += w;
+      }
+    }
+    onProgress((ci + 1) / starts.length, ci + 1, starts.length);
+    await tick();
+  }
+  for (let c = 0; c < 2; c++) for (let i = 0; i < n; i++) { const w = wsum[i] || 1; outV[c][i] /= w; outI[c][i] /= w; }
+  return { vocals: outV, inst: outI };
+}
+
+$('run').addEventListener('click', async () => {
+  const btn = $('run'), bar = $('bar');
+  btn.disabled = true; bar.hidden = false; bar.value = 0; $('result').innerHTML = '';
+  const t0 = performance.now();
+  try {
+    if (typeof ort === 'undefined') throw new Error('onnxruntime-webを読み込めませんでした。ネット接続を確認してください。');
+    ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+
+    log('曲を読み込んでいます…');
+    const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+    const decoded = await ac.decodeAudioData(await state.audio.arrayBuffer());
+    const left = decoded.getChannelData(0).slice();
+    const right = (decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : decoded.getChannelData(0)).slice();
+    ac.close();
+    const secs = left.length / SR;
+
+    log('モデルを読み込んでいます…');
+    await tick();
+    const mk = (prov) => ort.InferenceSession.create(new Uint8Array(state.model.slice(0)), { executionProviders: prov });
+    let provider = 'wasm', session = null;
+    if ($('gpu').checked && navigator.gpu) {
+      try { session = await mk(['webgpu']); provider = 'webgpu'; } catch (e) { session = null; }
+    }
+    if (!session) session = await mk(['wasm']);
+
+    const runner = async (sr, si) => {
+      const feeds = () => ({
+        spec_real: new ort.Tensor('float32', sr, [1, 2, BINS, T]),
+        spec_imag: new ort.Tensor('float32', si, [1, 2, BINS, T]),
+      });
+      let res;
+      try { res = await session.run(feeds()); }
+      catch (e) {
+        if (provider !== 'webgpu') throw e;
+        provider = 'wasm'; session = await mk(['wasm']);           // GPUで失敗したらCPUでやり直す
+        res = await session.run(feeds());
+      }
+      return { re: res.out_spec_real.data, im: res.out_spec_imag.data };
+    };
+
+    const res = await separate([left, right], runner, (p, i, total) => {
+      bar.value = p;
+      log((provider === 'webgpu' ? 'GPU' : 'CPU') + 'で分離しています… ' + i + '/' + total + '（' + Math.round(secs) + '秒の曲。このタブを開いたままにしてください）');
+    });
+
+    const stem = state.audio.name.replace(/\.[^.]+$/, '');
+    const add = (title, name, c) => {
+      const url = URL.createObjectURL(toWav(c[0], c[1]));
+      const d = document.createElement('div');
+      d.innerHTML = '<strong></strong><audio controls></audio><a download></a>';
+      d.querySelector('strong').textContent = title;
+      d.querySelector('audio').src = url;
+      const a = d.querySelector('a'); a.href = url; a.download = stem + '_' + name + '.wav'; a.textContent = 'WAVを保存';
+      d.style.marginBottom = '1rem';
+      $('result').appendChild(d);
+    };
+    add('ボーカル', 'vocals', res.vocals);
+    add('伴奏（カラオケ）', 'instrumental', res.inst);
+    log('完了（' + ((performance.now() - t0) / 1000).toFixed(0) + '秒、' + (provider === 'webgpu' ? 'GPU' : 'CPU') + '）');
+  } catch (e) {
+    log('エラー: ' + (e && e.message ? e.message : e), true);
+  }
+  btn.disabled = false; bar.hidden = true; refresh();
+});
+</script>
+</body>
+</html>
